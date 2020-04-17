@@ -91,8 +91,7 @@ v8::Local<v8::Value> NewRangeException(v8::Isolate* isolate,
                                        const char* message) {
   return v8::Exception::RangeError(
       v8::String::NewFromOneByte(isolate,
-                                 reinterpret_cast<const uint8_t*>(message),
-                                 v8::NewStringType::kNormal)
+                                 reinterpret_cast<const uint8_t*>(message))
           .ToLocalChecked());
 }
 
@@ -110,6 +109,11 @@ bool WasmInstanceOverride(const v8::FunctionCallbackInfo<v8::Value>& args) {
   if (IsWasmInstantiateAllowed(args.GetIsolate(), args[0], false)) return false;
   ThrowRangeException(args.GetIsolate(), "Sync instantiate not allowed");
   return true;
+}
+
+V8_WARN_UNUSED_RESULT Object CrashUnlessFuzzing(Isolate* isolate) {
+  CHECK(FLAG_fuzzing);
+  return ReadOnlyRoots(isolate).undefined_value();
 }
 
 }  // namespace
@@ -164,18 +168,13 @@ RUNTIME_FUNCTION(Runtime_DeoptimizeFunction) {
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
 
-  // This function is used by fuzzers to get coverage in compiler.
-  // Ignore calls on non-function objects to avoid runtime errors.
   CONVERT_ARG_HANDLE_CHECKED(Object, function_object, 0);
-  if (!function_object->IsJSFunction()) {
-    return ReadOnlyRoots(isolate).undefined_value();
-  }
+  if (!function_object->IsJSFunction()) return CrashUnlessFuzzing(isolate);
   Handle<JSFunction> function = Handle<JSFunction>::cast(function_object);
 
-  // If the function is not optimized, just return.
-  if (!function->IsOptimized()) return ReadOnlyRoots(isolate).undefined_value();
-
-  Deoptimizer::DeoptimizeFunction(*function);
+  if (function->IsOptimized()) {
+    Deoptimizer::DeoptimizeFunction(*function);
+  }
 
   return ReadOnlyRoots(isolate).undefined_value();
 }
@@ -189,12 +188,11 @@ RUNTIME_FUNCTION(Runtime_DeoptimizeNow) {
   // Find the JavaScript function on the top of the stack.
   JavaScriptFrameIterator it(isolate);
   if (!it.done()) function = handle(it.frame()->function(), isolate);
-  if (function.is_null()) return ReadOnlyRoots(isolate).undefined_value();
+  if (function.is_null()) return CrashUnlessFuzzing(isolate);
 
-  // If the function is not optimized, just return.
-  if (!function->IsOptimized()) return ReadOnlyRoots(isolate).undefined_value();
-
-  Deoptimizer::DeoptimizeFunction(*function);
+  if (function->IsOptimized()) {
+    Deoptimizer::DeoptimizeFunction(*function);
+  }
 
   return ReadOnlyRoots(isolate).undefined_value();
 }
@@ -239,24 +237,19 @@ RUNTIME_FUNCTION(Runtime_IsConcurrentRecompilationSupported) {
 RUNTIME_FUNCTION(Runtime_OptimizeFunctionOnNextCall) {
   HandleScope scope(isolate);
 
-  // This function is used by fuzzers, ignore calls with bogus arguments count.
   if (args.length() != 1 && args.length() != 2) {
-    return ReadOnlyRoots(isolate).undefined_value();
+    return CrashUnlessFuzzing(isolate);
   }
 
-  // This function is used by fuzzers to get coverage for optimizations
-  // in compiler. Ignore calls on non-function objects to avoid runtime errors.
   CONVERT_ARG_HANDLE_CHECKED(Object, function_object, 0);
-  if (!function_object->IsJSFunction()) {
-    return ReadOnlyRoots(isolate).undefined_value();
-  }
+  if (!function_object->IsJSFunction()) return CrashUnlessFuzzing(isolate);
   Handle<JSFunction> function = Handle<JSFunction>::cast(function_object);
 
   // The following conditions were lifted (in part) from the DCHECK inside
   // JSFunction::MarkForOptimization().
 
   if (!function->shared().allows_lazy_compilation()) {
-    return ReadOnlyRoots(isolate).undefined_value();
+    return CrashUnlessFuzzing(isolate);
   }
 
   // If function isn't compiled, compile it now.
@@ -264,18 +257,18 @@ RUNTIME_FUNCTION(Runtime_OptimizeFunctionOnNextCall) {
   if (!is_compiled_scope.is_compiled() &&
       !Compiler::Compile(function, Compiler::CLEAR_EXCEPTION,
                          &is_compiled_scope)) {
-    return ReadOnlyRoots(isolate).undefined_value();
+    return CrashUnlessFuzzing(isolate);
   }
 
-  if (!FLAG_opt || (function->shared().optimization_disabled() &&
-                    function->shared().disable_optimization_reason() ==
-                        BailoutReason::kNeverOptimize)) {
-    return ReadOnlyRoots(isolate).undefined_value();
+  if (!FLAG_opt) return ReadOnlyRoots(isolate).undefined_value();
+
+  if (function->shared().optimization_disabled() &&
+      function->shared().disable_optimization_reason() ==
+          BailoutReason::kNeverOptimize) {
+    return CrashUnlessFuzzing(isolate);
   }
 
-  if (function->shared().HasAsmWasmData()) {
-    return ReadOnlyRoots(isolate).undefined_value();
-  }
+  if (function->shared().HasAsmWasmData()) return CrashUnlessFuzzing(isolate);
 
   if (FLAG_testing_d8_test_runner) {
     PendingOptimizationTable::MarkedForOptimization(isolate, function);
@@ -291,11 +284,8 @@ RUNTIME_FUNCTION(Runtime_OptimizeFunctionOnNextCall) {
 
   ConcurrencyMode concurrency_mode = ConcurrencyMode::kNotConcurrent;
   if (args.length() == 2) {
-    // Ignore invalid inputs produced by fuzzers.
     CONVERT_ARG_HANDLE_CHECKED(Object, type, 1);
-    if (!type->IsString()) {
-      return ReadOnlyRoots(isolate).undefined_value();
-    }
+    if (!type->IsString()) return CrashUnlessFuzzing(isolate);
     if (Handle<String>::cast(type)->IsOneByteEqualTo(
             StaticCharVector("concurrent")) &&
         isolate->concurrent_recompilation_enabled()) {
@@ -356,9 +346,6 @@ bool EnsureFeedbackVector(Handle<JSFunction> function) {
 RUNTIME_FUNCTION(Runtime_EnsureFeedbackVectorForFunction) {
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
-  if (!args[0].IsJSFunction()) {
-    return ReadOnlyRoots(isolate).undefined_value();
-  }
   CONVERT_ARG_HANDLE_CHECKED(JSFunction, function, 0);
   EnsureFeedbackVector(function);
   return ReadOnlyRoots(isolate).undefined_value();
@@ -367,16 +354,13 @@ RUNTIME_FUNCTION(Runtime_EnsureFeedbackVectorForFunction) {
 RUNTIME_FUNCTION(Runtime_PrepareFunctionForOptimization) {
   HandleScope scope(isolate);
   DCHECK(args.length() == 1 || args.length() == 2);
-  if (!args[0].IsJSFunction()) {
-    return ReadOnlyRoots(isolate).undefined_value();
-  }
+  if (!args[0].IsJSFunction()) return CrashUnlessFuzzing(isolate);
   CONVERT_ARG_HANDLE_CHECKED(JSFunction, function, 0);
 
   bool allow_heuristic_optimization = false;
   if (args.length() == 2) {
     CONVERT_ARG_HANDLE_CHECKED(Object, sync_object, 1);
-    if (!sync_object->IsString())
-      return ReadOnlyRoots(isolate).undefined_value();
+    if (!sync_object->IsString()) return CrashUnlessFuzzing(isolate);
     Handle<String> sync = Handle<String>::cast(sync_object);
     if (sync->IsOneByteEqualTo(
             StaticCharVector("allow heuristic optimization"))) {
@@ -385,7 +369,7 @@ RUNTIME_FUNCTION(Runtime_PrepareFunctionForOptimization) {
   }
 
   if (!EnsureFeedbackVector(function)) {
-    return ReadOnlyRoots(isolate).undefined_value();
+    return CrashUnlessFuzzing(isolate);
   }
 
   // If optimization is disabled for the function, return without making it
@@ -393,13 +377,10 @@ RUNTIME_FUNCTION(Runtime_PrepareFunctionForOptimization) {
   if (function->shared().optimization_disabled() &&
       function->shared().disable_optimization_reason() ==
           BailoutReason::kNeverOptimize) {
-    return ReadOnlyRoots(isolate).undefined_value();
+    return CrashUnlessFuzzing(isolate);
   }
 
-  // We don't optimize Asm/Wasm functions.
-  if (function->shared().HasAsmWasmData()) {
-    return ReadOnlyRoots(isolate).undefined_value();
-  }
+  if (function->shared().HasAsmWasmData()) return CrashUnlessFuzzing(isolate);
 
   // Hold onto the bytecode array between marking and optimization to ensure
   // it's not flushed.
@@ -424,12 +405,14 @@ RUNTIME_FUNCTION(Runtime_OptimizeOsr) {
   JavaScriptFrameIterator it(isolate);
   while (!it.done() && stack_depth--) it.Advance();
   if (!it.done()) function = handle(it.frame()->function(), isolate);
-  if (function.is_null()) return ReadOnlyRoots(isolate).undefined_value();
+  if (function.is_null()) return CrashUnlessFuzzing(isolate);
 
-  if (!FLAG_opt || (function->shared().optimization_disabled() &&
-                    function->shared().disable_optimization_reason() ==
-                        BailoutReason::kNeverOptimize)) {
-    return ReadOnlyRoots(isolate).undefined_value();
+  if (!FLAG_opt) return ReadOnlyRoots(isolate).undefined_value();
+
+  if (function->shared().optimization_disabled() &&
+      function->shared().disable_optimization_reason() ==
+          BailoutReason::kNeverOptimize) {
+    return CrashUnlessFuzzing(isolate);
   }
 
   if (FLAG_testing_d8_test_runner) {
@@ -449,9 +432,10 @@ RUNTIME_FUNCTION(Runtime_OptimizeOsr) {
   // Ensure that the function is marked for non-concurrent optimization, so that
   // subsequent runs don't also optimize.
   if (FLAG_trace_osr) {
-    PrintF("[OSR - OptimizeOsr marking ");
-    function->ShortPrint();
-    PrintF(" for non-concurrent optimization]\n");
+    CodeTracer::Scope scope(isolate->GetCodeTracer());
+    PrintF(scope.file(), "[OSR - OptimizeOsr marking ");
+    function->ShortPrint(scope.file());
+    PrintF(scope.file(), " for non-concurrent optimization]\n");
   }
   JSFunction::EnsureFeedbackVector(function);
   function->MarkForOptimization(ConcurrencyMode::kNotConcurrent);
@@ -470,12 +454,8 @@ RUNTIME_FUNCTION(Runtime_OptimizeOsr) {
 RUNTIME_FUNCTION(Runtime_NeverOptimizeFunction) {
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
-  // This function is used by fuzzers to get coverage for optimizations
-  // in compiler. Ignore calls on non-function objects to avoid runtime errors.
   CONVERT_ARG_HANDLE_CHECKED(Object, function_object, 0);
-  if (!function_object->IsJSFunction()) {
-    return ReadOnlyRoots(isolate).undefined_value();
-  }
+  if (!function_object->IsJSFunction()) return CrashUnlessFuzzing(isolate);
   Handle<JSFunction> function = Handle<JSFunction>::cast(function_object);
   function->shared().DisableOptimization(BailoutReason::kNeverOptimize);
   return ReadOnlyRoots(isolate).undefined_value();
@@ -500,23 +480,25 @@ RUNTIME_FUNCTION(Runtime_GetOptimizationStatus) {
     status |= static_cast<int>(OptimizationStatus::kMaybeDeopted);
   }
 
-  // This function is used by fuzzers to get coverage for optimizations
-  // in compiler. Ignore calls on non-function objects to avoid runtime errors.
   CONVERT_ARG_HANDLE_CHECKED(Object, function_object, 0);
-  if (!function_object->IsJSFunction()) {
-    return Smi::FromInt(status);
-  }
+  if (function_object->IsUndefined()) return Smi::FromInt(status);
+  if (!function_object->IsJSFunction()) return CrashUnlessFuzzing(isolate);
   Handle<JSFunction> function = Handle<JSFunction>::cast(function_object);
+
   status |= static_cast<int>(OptimizationStatus::kIsFunction);
 
   bool sync_with_compiler_thread = true;
   if (args.length() == 2) {
     CONVERT_ARG_HANDLE_CHECKED(Object, sync_object, 1);
-    if (!sync_object->IsString())
-      return ReadOnlyRoots(isolate).undefined_value();
+    if (!sync_object->IsString()) return CrashUnlessFuzzing(isolate);
     Handle<String> sync = Handle<String>::cast(sync_object);
     if (sync->IsOneByteEqualTo(StaticCharVector("no sync"))) {
       sync_with_compiler_thread = false;
+    } else if (sync->IsOneByteEqualTo(StaticCharVector("sync")) ||
+               sync->length() == 0) {
+      DCHECK(sync_with_compiler_thread);
+    } else {
+      return CrashUnlessFuzzing(isolate);
     }
   }
 
@@ -575,10 +557,9 @@ RUNTIME_FUNCTION(Runtime_GetOptimizationStatus) {
 
 RUNTIME_FUNCTION(Runtime_UnblockConcurrentRecompilation) {
   DCHECK_EQ(0, args.length());
-  if (FLAG_block_concurrent_recompilation &&
-      isolate->concurrent_recompilation_enabled()) {
-    isolate->optimizing_compile_dispatcher()->Unblock();
-  }
+  CHECK(FLAG_block_concurrent_recompilation);
+  CHECK(isolate->concurrent_recompilation_enabled());
+  isolate->optimizing_compile_dispatcher()->Unblock();
   return ReadOnlyRoots(isolate).undefined_value();
 }
 
@@ -590,14 +571,11 @@ RUNTIME_FUNCTION(Runtime_GetUndetectable) {
   HandleScope scope(isolate);
   DCHECK_EQ(0, args.length());
   v8::Isolate* v8_isolate = reinterpret_cast<v8::Isolate*>(isolate);
-
   Local<v8::ObjectTemplate> desc = v8::ObjectTemplate::New(v8_isolate);
   desc->MarkAsUndetectable();
   desc->SetCallAsFunctionHandler(ReturnThis);
-  Local<v8::Object> obj;
-  if (!desc->NewInstance(v8_isolate->GetCurrentContext()).ToLocal(&obj)) {
-    return Object();
-  }
+  Local<v8::Object> obj =
+      desc->NewInstance(v8_isolate->GetCurrentContext()).ToLocalChecked();
   return *Utils::OpenHandle(*obj);
 }
 
@@ -630,9 +608,6 @@ RUNTIME_FUNCTION(Runtime_GetCallable) {
 RUNTIME_FUNCTION(Runtime_ClearFunctionFeedback) {
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
-  if (!args[0].IsJSFunction()) {
-    return ReadOnlyRoots(isolate).undefined_value();
-  }
   CONVERT_ARG_HANDLE_CHECKED(JSFunction, function, 0);
   function->ClearTypeFeedbackInfo();
   return ReadOnlyRoots(isolate).undefined_value();
@@ -730,7 +705,7 @@ RUNTIME_FUNCTION(Runtime_SimulateNewspaceFull) {
   HandleScope scope(isolate);
   Heap* heap = isolate->heap();
   NewSpace* space = heap->new_space();
-  AlwaysAllocateScope always_allocate(heap);
+  AlwaysAllocateScopeForTesting always_allocate(heap);
   do {
     FillUpOneNewSpacePage(isolate, heap);
   } while (space->AddFreshPage());
@@ -816,24 +791,19 @@ RUNTIME_FUNCTION(Runtime_DebugTrackRetainingPath) {
   HandleScope scope(isolate);
   DCHECK_LE(1, args.length());
   DCHECK_GE(2, args.length());
-  if (!FLAG_track_retaining_path) {
-    PrintF("DebugTrackRetainingPath requires --track-retaining-path flag.\n");
-  } else {
-    CONVERT_ARG_HANDLE_CHECKED(HeapObject, object, 0);
-    RetainingPathOption option = RetainingPathOption::kDefault;
-    if (args.length() == 2) {
-      CONVERT_ARG_HANDLE_CHECKED(String, str, 1);
-      const char track_ephemeron_path[] = "track-ephemeron-path";
-      if (str->IsOneByteEqualTo(StaticCharVector(track_ephemeron_path))) {
-        option = RetainingPathOption::kTrackEphemeronPath;
-      } else if (str->length() != 0) {
-        PrintF("Unexpected second argument of DebugTrackRetainingPath.\n");
-        PrintF("Expected an empty string or '%s', got '%s'.\n",
-               track_ephemeron_path, str->ToCString().get());
-      }
+  CHECK(FLAG_track_retaining_path);
+  CONVERT_ARG_HANDLE_CHECKED(HeapObject, object, 0);
+  RetainingPathOption option = RetainingPathOption::kDefault;
+  if (args.length() == 2) {
+    CONVERT_ARG_HANDLE_CHECKED(String, str, 1);
+    const char track_ephemeron_path[] = "track-ephemeron-path";
+    if (str->IsOneByteEqualTo(StaticCharVector(track_ephemeron_path))) {
+      option = RetainingPathOption::kTrackEphemeronPath;
+    } else {
+      CHECK_EQ(str->length(), 0);
     }
-    isolate->heap()->AddRetainingPathTarget(object, option);
   }
+  isolate->heap()->AddRetainingPathTarget(object, option);
   return ReadOnlyRoots(isolate).undefined_value();
 }
 
@@ -919,10 +889,8 @@ RUNTIME_FUNCTION(Runtime_DisassembleFunction) {
   // Get the function and make sure it is compiled.
   CONVERT_ARG_HANDLE_CHECKED(JSFunction, func, 0);
   IsCompiledScope is_compiled_scope;
-  if (!func->is_compiled() &&
-      !Compiler::Compile(func, Compiler::KEEP_EXCEPTION, &is_compiled_scope)) {
-    return ReadOnlyRoots(isolate).exception();
-  }
+  CHECK(func->is_compiled() ||
+        Compiler::Compile(func, Compiler::KEEP_EXCEPTION, &is_compiled_scope));
   StdoutStream os;
   func->code().Print(os);
   os << std::endl;
@@ -1001,7 +969,6 @@ RUNTIME_FUNCTION(Runtime_IsAsmWasmCode) {
   DCHECK_EQ(1, args.length());
   CONVERT_ARG_CHECKED(JSFunction, function, 0);
   if (!function.shared().HasAsmWasmData()) {
-    // Doesn't have wasm data.
     return ReadOnlyRoots(isolate).false_value();
   }
   if (function.shared().HasBuiltinId() &&
@@ -1080,13 +1047,12 @@ RUNTIME_FUNCTION(Runtime_GetWasmExceptionId) {
   CONVERT_ARG_HANDLE_CHECKED(WasmInstanceObject, instance, 1);
   Handle<Object> tag =
       WasmExceptionPackage::GetExceptionTag(isolate, exception);
-  if (tag->IsWasmExceptionTag()) {
-    Handle<FixedArray> exceptions_table(instance->exceptions_table(), isolate);
-    for (int index = 0; index < exceptions_table->length(); ++index) {
-      if (exceptions_table->get(index) == *tag) return Smi::FromInt(index);
-    }
+  CHECK(tag->IsWasmExceptionTag());
+  Handle<FixedArray> exceptions_table(instance->exceptions_table(), isolate);
+  for (int index = 0; index < exceptions_table->length(); ++index) {
+    if (exceptions_table->get(index) == *tag) return Smi::FromInt(index);
   }
-  return ReadOnlyRoots(isolate).undefined_value();
+  UNREACHABLE();
 }
 
 RUNTIME_FUNCTION(Runtime_GetWasmExceptionValues) {
@@ -1102,7 +1068,6 @@ RUNTIME_FUNCTION(Runtime_GetWasmExceptionValues) {
 
 namespace {
 bool EnableWasmThreads(v8::Local<v8::Context> context) { return true; }
-
 bool DisableWasmThreads(v8::Local<v8::Context> context) { return false; }
 }  // namespace
 
@@ -1226,8 +1191,7 @@ RUNTIME_FUNCTION(Runtime_SerializeWasmModule) {
     return *array_buffer;
   }
 
-  // Error. Return undefined.
-  return ReadOnlyRoots(isolate).undefined_value();
+  UNREACHABLE();
 }
 
 // Take an array buffer and attempt to reconstruct a compiled wasm module.

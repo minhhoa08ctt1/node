@@ -3,12 +3,14 @@
 // found in the LICENSE file.
 
 #include "src/compiler/js-heap-broker.h"
+#include "src/common/globals.h"
 #include "src/compiler/heap-refs.h"
 
 #ifdef ENABLE_SLOW_DCHECKS
 #include <algorithm>
 #endif
 
+#include "include/v8-fast-api-calls.h"
 #include "src/api/api-inl.h"
 #include "src/ast/modules.h"
 #include "src/codegen/code-factory.h"
@@ -226,6 +228,8 @@ class FunctionTemplateInfoData : public HeapObjectData {
 
   void SerializeCallCode(JSHeapBroker* broker);
   CallHandlerInfoData* call_code() const { return call_code_; }
+  Address c_function() const { return c_function_; }
+  const CFunctionInfo* c_signature() const { return c_signature_; }
   KnownReceiversMap& known_receivers() { return known_receivers_; }
 
  private:
@@ -234,6 +238,8 @@ class FunctionTemplateInfoData : public HeapObjectData {
   bool has_call_code_ = false;
 
   CallHandlerInfoData* call_code_ = nullptr;
+  const Address c_function_;
+  const CFunctionInfo* const c_signature_;
   KnownReceiversMap known_receivers_;
 };
 
@@ -257,6 +263,8 @@ FunctionTemplateInfoData::FunctionTemplateInfoData(
     JSHeapBroker* broker, ObjectData** storage,
     Handle<FunctionTemplateInfo> object)
     : HeapObjectData(broker, storage, object),
+      c_function_(v8::ToCData<Address>(object->GetCFunction())),
+      c_signature_(v8::ToCData<CFunctionInfo*>(object->GetCSignature())),
       known_receivers_(broker->zone()) {
   auto function_template_info = Handle<FunctionTemplateInfo>::cast(object);
   is_signature_undefined_ =
@@ -821,9 +829,12 @@ StringData::StringData(JSHeapBroker* broker, ObjectData** storage,
       is_external_string_(object->IsExternalString()),
       is_seq_string_(object->IsSeqString()),
       chars_as_strings_(broker->zone()) {
-  int flags = ALLOW_HEX | ALLOW_OCTAL | ALLOW_BINARY;
   if (length_ <= kMaxLengthForDoubleConversion) {
-    to_number_ = StringToDouble(broker->isolate(), object, flags);
+    const int flags = ALLOW_HEX | ALLOW_OCTAL | ALLOW_BINARY;
+    uc16 buffer[kMaxLengthForDoubleConversion];
+    String::WriteToFlat(*object, buffer, 0, length_);
+    Vector<const uc16> v(buffer, length_);
+    to_number_ = StringToDouble(v, flags);
   }
 }
 
@@ -1353,7 +1364,13 @@ class FeedbackVectorData : public HeapObjectData {
 
   double invocation_count() const { return invocation_count_; }
 
+  SharedFunctionInfoData* shared_function_info() {
+    CHECK(serialized_);
+    return shared_function_info_;
+  }
+
   void Serialize(JSHeapBroker* broker);
+  bool serialized() const { return serialized_; }
   FeedbackCellData* GetClosureFeedbackCell(JSHeapBroker* broker,
                                            int index) const;
 
@@ -1361,6 +1378,7 @@ class FeedbackVectorData : public HeapObjectData {
   double const invocation_count_;
 
   bool serialized_ = false;
+  SharedFunctionInfoData* shared_function_info_;
   ZoneVector<ObjectData*> closure_feedback_cell_array_;
 };
 
@@ -1392,6 +1410,9 @@ void FeedbackVectorData::Serialize(JSHeapBroker* broker) {
 
   TraceScope tracer(broker, this, "FeedbackVectorData::Serialize");
   Handle<FeedbackVector> vector = Handle<FeedbackVector>::cast(object());
+  Handle<SharedFunctionInfo> sfi(vector->shared_function_info(),
+                                 broker->isolate());
+  shared_function_info_ = broker->GetOrCreateData(sfi)->AsSharedFunctionInfo();
   DCHECK(closure_feedback_cell_array_.empty());
   int length = vector->closure_feedback_cell_array().length();
   closure_feedback_cell_array_.reserve(length);
@@ -2510,23 +2531,17 @@ void JSHeapBroker::CollectArrayAndObjectPrototypes() {
   CHECK(!array_and_object_prototypes_.empty());
 }
 
-void JSHeapBroker::SerializeTypedArrayStringTags() {
-#define TYPED_ARRAY_STRING_TAG(Type, type, TYPE, ctype)              \
-  do {                                                               \
-    ObjectData* data = GetOrCreateData(                              \
-        isolate()->factory()->InternalizeUtf8String(#Type "Array")); \
-    typed_array_string_tags_.push_back(data);                        \
-  } while (false);
-
-  TYPED_ARRAYS(TYPED_ARRAY_STRING_TAG)
-#undef TYPED_ARRAY_STRING_TAG
-}
-
 StringRef JSHeapBroker::GetTypedArrayStringTag(ElementsKind kind) {
   DCHECK(IsTypedArrayElementsKind(kind));
-  size_t idx = kind - FIRST_FIXED_TYPED_ARRAY_ELEMENTS_KIND;
-  CHECK_LT(idx, typed_array_string_tags_.size());
-  return StringRef(this, typed_array_string_tags_[idx]);
+  switch (kind) {
+#define TYPED_ARRAY_STRING_TAG(Type, type, TYPE, ctype) \
+  case ElementsKind::TYPE##_ELEMENTS:                   \
+    return StringRef(this, isolate()->factory()->Type##Array_string());
+    TYPED_ARRAYS(TYPED_ARRAY_STRING_TAG)
+#undef TYPED_ARRAY_STRING_TAG
+    default:
+      UNREACHABLE();
+  }
 }
 
 bool JSHeapBroker::ShouldBeSerializedForCompilation(
@@ -2593,7 +2608,6 @@ void JSHeapBroker::InitializeAndStartSerializing(
   target_native_context().Serialize();
 
   CollectArrayAndObjectPrototypes();
-  SerializeTypedArrayStringTags();
 
   // Serialize Cells
   Factory* const f = isolate()->factory();
@@ -3676,6 +3690,20 @@ Address CallHandlerInfoRef::callback() const {
   return HeapObjectRef::data()->AsCallHandlerInfo()->callback();
 }
 
+Address FunctionTemplateInfoRef::c_function() const {
+  if (broker()->mode() == JSHeapBroker::kDisabled) {
+    return v8::ToCData<Address>(object()->GetCFunction());
+  }
+  return HeapObjectRef::data()->AsFunctionTemplateInfo()->c_function();
+}
+
+const CFunctionInfo* FunctionTemplateInfoRef::c_signature() const {
+  if (broker()->mode() == JSHeapBroker::kDisabled) {
+    return v8::ToCData<CFunctionInfo*>(object()->GetCSignature());
+  }
+  return HeapObjectRef::data()->AsFunctionTemplateInfo()->c_signature();
+}
+
 bool StringRef::IsSeqString() const {
   IF_ACCESS_FROM_HEAP_C(String, IsSeqString);
   return data()->AsString()->is_seq_string();
@@ -3692,6 +3720,22 @@ ScopeInfoRef NativeContextRef::scope_info() const {
                         handle(object()->scope_info(), broker()->isolate()));
   }
   return ScopeInfoRef(broker(), data()->AsNativeContext()->scope_info());
+}
+
+SharedFunctionInfoRef FeedbackVectorRef::shared_function_info() const {
+  if (data_->should_access_heap()) {
+    DCHECK(data_->kind() != ObjectDataKind::kUnserializedReadOnlyHeapObject);
+    AllowHandleAllocationIf allow_handle_allocation(data()->kind(),
+                                                    broker()->mode());
+    AllowHandleDereferenceIf allow_handle_dereference(data()->kind(),
+                                                      broker()->mode());
+    return SharedFunctionInfoRef(
+        broker(),
+        handle(object()->shared_function_info(), broker()->isolate()));
+  }
+
+  return SharedFunctionInfoRef(
+      broker(), data()->AsFeedbackVector()->shared_function_info());
 }
 
 MapRef NativeContextRef::GetFunctionMapFromIndex(int index) const {
@@ -4007,8 +4051,25 @@ Float64 FixedDoubleArrayData::Get(int i) const {
   return contents_[i];
 }
 
+base::Optional<SharedFunctionInfoRef> FeedbackCellRef::shared_function_info()
+    const {
+  if (value().IsFeedbackVector()) {
+    FeedbackVectorRef vector = value().AsFeedbackVector();
+    if (vector.serialized()) {
+      return value().AsFeedbackVector().shared_function_info();
+    }
+  }
+  return base::nullopt;
+}
+
 void FeedbackVectorRef::Serialize() {
   data()->AsFeedbackVector()->Serialize(broker());
+}
+
+bool FeedbackVectorRef::serialized() const {
+  DCHECK(data_->kind() != ObjectDataKind::kUnserializedReadOnlyHeapObject);
+  if (data_->should_access_heap()) return true;
+  return data()->AsFeedbackVector()->serialized();
 }
 
 bool NameRef::IsUniqueName() const {
@@ -4430,7 +4491,6 @@ GlobalAccessFeedback::GlobalAccessFeedback(PropertyCellRef cell,
 
 GlobalAccessFeedback::GlobalAccessFeedback(FeedbackSlotKind slot_kind)
     : ProcessedFeedback(kGlobalAccess, slot_kind),
-      cell_or_context_(base::nullopt),
       index_and_immutable_(0 /* doesn't matter */) {
   DCHECK(IsGlobalICKind(slot_kind));
 }
@@ -4609,17 +4669,25 @@ bool JSHeapBroker::FeedbackIsInsufficient(FeedbackSource const& source) const {
 }
 
 namespace {
-MapHandles GetRelevantReceiverMaps(Isolate* isolate, MapHandles const& maps) {
-  MapHandles result;
-  for (Handle<Map> map : maps) {
+// Remove unupdatable and abandoned prototype maps in-place.
+void FilterRelevantReceiverMaps(Isolate* isolate, MapHandles* maps) {
+  auto in = maps->begin();
+  auto out = in;
+  auto end = maps->end();
+
+  for (; in != end; ++in) {
+    Handle<Map> map = *in;
     if (Map::TryUpdate(isolate, map).ToHandle(&map) &&
         !map->is_abandoned_prototype_map()) {
       DCHECK(!map->is_deprecated());
-      result.push_back(map);
+      *out = *in;
+      ++out;
     }
   }
-  return result;
-}  // namespace
+
+  // Remove everything between the last valid map and the end of the vector.
+  maps->erase(out, end);
+}
 }  // namespace
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForPropertyAccess(
@@ -4631,14 +4699,19 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForPropertyAccess(
 
   MapHandles maps;
   nexus.ExtractMaps(&maps);
-  if (!maps.empty()) {
-    maps = GetRelevantReceiverMaps(isolate(), maps);
-    if (maps.empty()) return *new (zone()) InsufficientFeedback(kind);
+  FilterRelevantReceiverMaps(isolate(), &maps);
+
+  // If no maps were found for a non-megamorphic access, then our maps died and
+  // we should soft-deopt.
+  if (maps.empty() && nexus.ic_state() != MEGAMORPHIC) {
+    return *new (zone()) InsufficientFeedback(kind);
   }
 
   base::Optional<NameRef> name =
       static_name.has_value() ? static_name : GetNameFeedback(nexus);
   if (name.has_value()) {
+    // We rely on this invariant in JSGenericLowering.
+    DCHECK_IMPLIES(maps.empty(), nexus.ic_state() == MEGAMORPHIC);
     return *new (zone()) NamedAccessFeedback(
         *name, ZoneVector<Handle<Map>>(maps.begin(), maps.end(), zone()), kind);
   } else if (nexus.GetKeyType() == ELEMENT && !maps.empty()) {
@@ -4647,8 +4720,7 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForPropertyAccess(
   } else {
     // No actionable feedback.
     DCHECK(maps.empty());
-    // TODO(neis): Investigate if we really want to treat cleared the same as
-    // megamorphic (also for global accesses).
+    DCHECK_EQ(nexus.ic_state(), MEGAMORPHIC);
     // TODO(neis): Using ElementAccessFeedback here is kind of an abuse.
     return *new (zone())
         ElementAccessFeedback(zone(), KeyedAccessMode::FromNexus(nexus), kind);
